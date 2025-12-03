@@ -47,11 +47,7 @@ export class McpApiHandler extends WorkerEntrypoint<Env> {
  * Default Handler - Handles OAuth flow and browser UI
  */
 const defaultHandler = {
-  async fetch(
-    request: Request,
-    env: Env,
-    ctx: ExecutionContext
-  ): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
     // 1. ChatGPT → /authorize (OAuth authorization endpoint)
@@ -71,10 +67,7 @@ const defaultHandler = {
       // Redirect to GitHub OAuth authorization
       const githubAuthUrl = new URL("https://github.com/login/oauth/authorize");
       githubAuthUrl.searchParams.set("client_id", env.GITHUB_CLIENT_ID);
-      githubAuthUrl.searchParams.set(
-        "redirect_uri",
-        `${url.origin}/github/callback`
-      );
+      githubAuthUrl.searchParams.set("redirect_uri", `${url.origin}/github/callback`);
       githubAuthUrl.searchParams.set("state", state);
       githubAuthUrl.searchParams.set("scope", "repo");
       githubAuthUrl.searchParams.set("allow_signup", "false");
@@ -100,29 +93,22 @@ const defaultHandler = {
       const oauthReq = JSON.parse(stored);
 
       // Exchange code for GitHub access token
-      const tokenRes = await fetch(
-        "https://github.com/login/oauth/access_token",
-        {
-          method: "POST",
-          headers: {
-            Accept: "application/json",
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            client_id: env.GITHUB_CLIENT_ID,
-            client_secret: env.GITHUB_CLIENT_SECRET,
-            code,
-            redirect_uri: `${url.origin}/github/callback`,
-          }),
-        }
-      );
+      const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          client_id: env.GITHUB_CLIENT_ID,
+          client_secret: env.GITHUB_CLIENT_SECRET,
+          code,
+          redirect_uri: `${url.origin}/github/callback`,
+        }),
+      });
 
       if (!tokenRes.ok) {
-        console.error(
-          "Failed to fetch GitHub token:",
-          tokenRes.status,
-          tokenRes.statusText
-        );
+        console.error("Failed to fetch GitHub token:", tokenRes.status, tokenRes.statusText);
         return new Response("Failed to fetch GitHub token", { status: 500 });
       }
 
@@ -136,7 +122,7 @@ const defaultHandler = {
         console.error("GitHub OAuth error:", tokenJson.error, tokenJson.error_description);
         return new Response(
           `GitHub OAuth error: ${tokenJson.error_description || tokenJson.error}`,
-          { status: 500 }
+          { status: 500 },
         );
       }
 

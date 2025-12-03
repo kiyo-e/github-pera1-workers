@@ -32,20 +32,14 @@ export function createMcpApp() {
     "fetch_github_code",
     {
       title: "GitHub Code Fetcher",
-      description:
-        "Fetch code from GitHub repositories with flexible filtering options",
+      description: "Fetch code from GitHub repositories with flexible filtering options",
       inputSchema: {
-        url: z
-          .string()
-          .describe("GitHub repository URL (e.g., https://github.com/owner/repo)"),
+        url: z.string().describe("GitHub repository URL (e.g., https://github.com/owner/repo)"),
         dir: z.string().optional().describe("Filter by directory path (optional)"),
         ext: z.string().optional().describe("Filter by file extensions (optional)"),
         branch: z.string().optional().describe("Git branch name (optional)"),
         file: z.string().optional().describe("Specific file to fetch (optional)"),
-        mode: z
-          .enum(["tree", "full"])
-          .optional()
-          .describe("Display mode (optional)"),
+        mode: z.enum(["tree", "full"]).optional().describe("Display mode (optional)"),
       },
     },
     async (args, ctx) => {
@@ -60,7 +54,7 @@ export function createMcpApp() {
 
         if (!args.url) {
           throw new Error(
-            "URL parameter is required. Please provide a GitHub repository URL (e.g., https://github.com/owner/repo)"
+            "URL parameter is required. Please provide a GitHub repository URL (e.g., https://github.com/owner/repo)",
           );
         }
 
@@ -75,10 +69,10 @@ export function createMcpApp() {
         };
       } catch (error) {
         throw new Error(
-          `Failed to fetch GitHub code: ${error instanceof Error ? error.message : "Unknown error"}`
+          `Failed to fetch GitHub code: ${error instanceof Error ? error.message : "Unknown error"}`,
         );
       }
-    }
+    },
   );
 
   app.all("/mcp", async (c) => {

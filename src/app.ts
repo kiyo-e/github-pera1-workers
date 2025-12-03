@@ -20,7 +20,7 @@ function createErrorResponse(
   c: Context,
   targetUrl: string,
   errorMessage: string,
-  status: 400 | 403 | 404 | 500
+  status: 400 | 403 | 404 | 500,
 ) {
   const host = c.req.header("host") || "";
   const protocol = c.req.url.startsWith("https") ? "https" : "http";
@@ -226,7 +226,7 @@ function createErrorResponse(
     </body>
     </html>
   `,
-    status
+    status,
   );
 }
 

@@ -16,27 +16,30 @@ const MAX_DISPLAY_FILE_SIZE = 30 * 1024; // 30KB
 export async function fetchZip(owner: string, repo: string, branch: string, token?: string | null) {
   const zipUrl = `https://codeload.github.com/${owner}/${repo}/zip/${branch}`;
   console.log(`📦 Fetching zip from: ${zipUrl}`);
-  
+
   const headers: Record<string, string> = {
     "User-Agent": "Pera1-Bot",
   };
 
   if (token) {
-    headers['Authorization'] = `Bearer ${token}`;
+    headers["Authorization"] = `Bearer ${token}`;
   }
 
   return await fetch(zipUrl, { headers });
 }
 
 // 既存のGitHub処理ロジックを関数として抽出
-export async function processGitHubRepository(params: any, githubAccessToken?: string | null): Promise<string> {
+export async function processGitHubRepository(
+  params: any,
+  githubAccessToken?: string | null,
+): Promise<string> {
   const { url, dir, ext, branch: paramBranch, file: queryFile, mode } = params;
-  
+
   let parsed: URL;
   try {
-    parsed = new URL(url.startsWith('http') ? url : `https://${url}`);
+    parsed = new URL(url.startsWith("http") ? url : `https://${url}`);
   } catch (error) {
-    throw new Error(`Invalid URL: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    throw new Error(`Invalid URL: ${error instanceof Error ? error.message : "Unknown error"}`);
   }
 
   const segments = parsed.pathname.split("/").filter(Boolean);
@@ -77,19 +80,25 @@ export async function processGitHubRepository(params: any, githubAccessToken?: s
       pathTargetDirs = [scopePath.endsWith("/") ? scopePath : `${scopePath}/`];
     }
   }
-  
+
   // パラメータの処理
-  const queryDirs = dir?.split(",").map((d: string) => d.trim()).filter((d: string) => d);
-  const queryExts = ext?.split(",").map((e: string) => e.trim().toLowerCase()).filter((e: string) => e);
+  const queryDirs = dir
+    ?.split(",")
+    .map((d: string) => d.trim())
+    .filter((d: string) => d);
+  const queryExts = ext
+    ?.split(",")
+    .map((e: string) => e.trim().toLowerCase())
+    .filter((e: string) => e);
   const isTreeMode = mode === "tree";
-  
+
   // Branch: query parameter has highest priority, then path-embedded branch, finally main
   let branch = paramBranch || pathBranch || "main";
 
   const baseDir = pathTargetDirs[0] || "";
   const normalizeDir = (d: string) => {
     const trimmed = d.replace(/^\/+/, "");
-    const withSlash = trimmed.endsWith('/') ? trimmed : `${trimmed}/`;
+    const withSlash = trimmed.endsWith("/") ? trimmed : `${trimmed}/`;
     if (!baseDir) return withSlash;
     if (withSlash.startsWith(baseDir)) return withSlash;
     return baseDir + withSlash;
@@ -107,7 +116,7 @@ export async function processGitHubRepository(params: any, githubAccessToken?: s
 
   let targetFile: string | undefined;
   if (queryFile) {
-    const normalized = queryFile.startsWith('/') ? queryFile.slice(1) : queryFile;
+    const normalized = queryFile.startsWith("/") ? queryFile.slice(1) : queryFile;
     if (baseDir && !normalized.startsWith(baseDir)) {
       targetFile = baseDir + normalized;
     } else {
@@ -125,7 +134,7 @@ export async function processGitHubRepository(params: any, githubAccessToken?: s
     let foundBranch = false;
     for (const defaultBranch of defaultBranches) {
       if (branch === defaultBranch) continue;
-      
+
       const tempResp = await fetchZip(owner, repo, defaultBranch, githubAccessToken);
       if (tempResp.ok) {
         branch = defaultBranch;
@@ -134,7 +143,7 @@ export async function processGitHubRepository(params: any, githubAccessToken?: s
         break;
       }
     }
-    
+
     if (!foundBranch) {
       throw new GitHubFetchError(zipResp.status, zipResp.statusText);
     }
@@ -146,7 +155,7 @@ export async function processGitHubRepository(params: any, githubAccessToken?: s
 
   // TypeScript プロジェクト判定
   const hasTsConfig = Object.keys(jszip.files).some(
-    (name) => name.startsWith(rootPrefix) && name.endsWith("tsconfig.json")
+    (name) => name.startsWith(rootPrefix) && name.endsWith("tsconfig.json"),
   );
 
   const fileTree = new Map<string, { size: number; content: string; isTruncated?: boolean }>();
@@ -177,11 +186,11 @@ export async function processGitHubRepository(params: any, githubAccessToken?: s
       if (shouldSkipFile(fileRelative, size, content, hasTsConfig)) {
         continue;
       }
-      
+
       let isTruncated = false;
       let processedContent = content;
       let displaySize = size;
-      
+
       if (size > MAX_DISPLAY_FILE_SIZE) {
         processedContent = content.substring(0, MAX_DISPLAY_FILE_SIZE);
         const remainingSize = (size - MAX_DISPLAY_FILE_SIZE) / 1024;
@@ -189,14 +198,14 @@ export async function processGitHubRepository(params: any, githubAccessToken?: s
         isTruncated = true;
         displaySize = MAX_DISPLAY_FILE_SIZE;
       }
-      
+
       originalTotalSize += size;
       displayTotalSize += displaySize;
-      
-      fileTree.set(fileRelative, { 
-        size, 
+
+      fileTree.set(fileRelative, {
+        size,
         content: processedContent,
-        isTruncated
+        isTruncated,
       });
     }
   }
@@ -214,17 +223,18 @@ export async function processGitHubRepository(params: any, githubAccessToken?: s
   if (isTreeMode) {
     let resultText = "# Directory Structure\n\n";
     resultText += createTreeDisplay(fileTree, false);
-    
-    const readmeFiles = Array.from(fileTree.entries())
-      .filter(([path, { content }]) => /readme\.md$/i.test(path) && content);
-    
+
+    const readmeFiles = Array.from(fileTree.entries()).filter(
+      ([path, { content }]) => /readme\.md$/i.test(path) && content,
+    );
+
     if (readmeFiles.length > 0) {
       resultText += "\n# README Files\n\n";
       for (const [path, { content }] of readmeFiles) {
         resultText += `## ${path}\n\n${content}\n\n`;
       }
     }
-    
+
     return resultText;
   } else {
     let resultText = "# 📁 File Tree\n\n";
@@ -347,12 +357,10 @@ function shouldSkipFile(
   if (filename.match(/-lock\.|\.lock$/)) return true;
 
   // バイナリ拡張子除外
-  if (imageExtensions.has(`.${ext}`) || binaryExtensions.has(`.${ext}`))
-    return true;
+  if (imageExtensions.has(`.${ext}`) || binaryExtensions.has(`.${ext}`)) return true;
 
   // TSプロジェクトの場合、.jsや.mjsは除外
-  if (hasTsConfig && (filename.endsWith(".js") || filename.endsWith(".mjs")))
-    return true;
+  if (hasTsConfig && (filename.endsWith(".js") || filename.endsWith(".mjs"))) return true;
 
   // サイズ制限
   if (size > MAX_FILE_SIZE) return true;
@@ -364,11 +372,7 @@ function shouldSkipFile(
 }
 
 // ディレクトリ・拡張子フィルタによる出力可否
-function shouldIncludeFile(
-  filename: string,
-  targetDirs: string[],
-  targetExts: string[],
-): boolean {
+function shouldIncludeFile(filename: string, targetDirs: string[], targetExts: string[]): boolean {
   // ディレクトリフィルタ
   if (targetDirs.length > 0) {
     const matchesDir = targetDirs.some((dir) => {
