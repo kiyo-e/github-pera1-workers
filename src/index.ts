@@ -56,12 +56,8 @@ const defaultHandler = {
 
     // 1. ChatGPT → /authorize (OAuth authorization endpoint)
     if (url.pathname === "/authorize") {
-      console.log("[/authorize] Query params:", Object.fromEntries(url.searchParams));
-
       // Parse the OAuth authorization request from ChatGPT
       const oauthReq = await (env as any).OAUTH_PROVIDER.parseAuthRequest(request);
-      console.log("[/authorize] Parsed oauthReq:", JSON.stringify(oauthReq, null, 2));
-
       if (!oauthReq) {
         return new Response("Invalid OAuth request", { status: 400 });
       }
@@ -88,8 +84,6 @@ const defaultHandler = {
 
     // 2. GitHub → /github/callback (OAuth callback from GitHub)
     if (url.pathname === "/github/callback") {
-      console.log("[/github/callback] Query params:", Object.fromEntries(url.searchParams));
-
       const code = url.searchParams.get("code");
       const state = url.searchParams.get("state");
       if (!code || !state) {
@@ -98,15 +92,12 @@ const defaultHandler = {
 
       // Retrieve stored OAuth request
       const stored = await env.OAUTH_KV.get(`oauthreq:${state}`);
-      console.log("[/github/callback] Stored oauthReq from KV:", stored);
-
       if (!stored) {
         return new Response("Invalid or expired state", { status: 400 });
       }
       await env.OAUTH_KV.delete(`oauthreq:${state}`);
 
       const oauthReq = JSON.parse(stored);
-      console.log("[/github/callback] Parsed oauthReq:", JSON.stringify(oauthReq, null, 2));
 
       // Exchange code for GitHub access token
       const tokenRes = await fetch(
@@ -174,17 +165,9 @@ const defaultHandler = {
           userId = `github_${userJson.id}`;
         }
       }
-      console.log("[/github/callback] userId:", userId);
 
       // Complete authorization and issue our access token
       // The props will be available in McpApiHandler via this.ctx.props
-      console.log("[/github/callback] Calling completeAuthorization with:", {
-        request: oauthReq,
-        userId,
-        metadata: { provider: "github" },
-        scope: oauthReq.scope,
-      });
-
       const { redirectTo } = await (env as any).OAUTH_PROVIDER.completeAuthorization({
         request: oauthReq,
         userId,
@@ -195,7 +178,6 @@ const defaultHandler = {
         } as AuthProps,
       });
 
-      console.log("[/github/callback] completeAuthorization redirectTo:", redirectTo);
       return Response.redirect(redirectTo, 302);
     }
 
