@@ -1,0 +1,26 @@
+diff --git a/dist/oauth-provider.js b/dist/oauth-provider.js
+index 026c6768bfd32145cf68f77db72d3cc88c89a149..5461cdb3aa5107b450b65060bc82bbfba798c42b 100644
+--- a/dist/oauth-provider.js
++++ b/dist/oauth-provider.js
+@@ -1141,7 +1141,20 @@ function validateResourceUri(uri) {
+   }
+ }
+ function audienceMatches(resourceServerUrl, audienceValue) {
+-  return resourceServerUrl === audienceValue;
++  // Exact match
++  if (resourceServerUrl === audienceValue) {
++    return true;
++  }
++  // RFC 8707: Allow audience with path to match resource server host
++  // e.g., "https://host/mcp" should match resource server "https://host"
++  try {
++    const audienceUrl = new URL(audienceValue);
++    const resourceUrl = new URL(resourceServerUrl);
++    // Match if same origin (protocol + host)
++    return audienceUrl.origin === resourceUrl.origin;
++  } catch {
++    return false;
++  }
+ }
+ function parseResourceParameter(value) {
+   if (!value) {

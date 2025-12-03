@@ -8,14 +8,20 @@
     "tail": "wrangler tail"
   },
   "dependencies": {
-    "@hono/mcp": "^0.1.1",
-    "@modelcontextprotocol/sdk": "^1.17.4",
-    "hono": "^4.7.5",
+    "@cloudflare/workers-oauth-provider": "^0.1.0",
+    "@hono/mcp": "^0.1.5",
+    "@modelcontextprotocol/sdk": "^1.23.0",
+    "hono": "^4.10.7",
     "jszip": "^3.10.1",
     "zod": "^3.24.1"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20250405.0",
-    "wrangler": "^4.7.2"
+    "@cloudflare/workers-types": "^4.20251128.0",
+    "wrangler": "^4.51.0"
+  },
+  "pnpm": {
+    "patchedDependencies": {
+      "@cloudflare/workers-oauth-provider": "patches/@cloudflare__workers-oauth-provider.patch"
+    }
   }
 }

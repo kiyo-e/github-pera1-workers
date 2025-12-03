@@ -1,5 +1,16 @@
 name = "pera1"
 main = "src/index.ts"
-compatibility_date = "2023-12-05"
+compatibility_date = "2025-11-28"
+compatibility_flags = [ "nodejs_compat" ]
 
-assets = { directory = "./public/" }
+[assets]
+directory = "./public/"
+
+# KV namespace for OAuth token and client storage
+[[kv_namespaces]]
+binding = "OAUTH_KV"
+id = "7867ebe2419c41b7a6d6fabffa54b7d4"
+
+# GitHub OAuth credentials (set via wrangler secret)
+# Run: wrangler secret put GITHUB_CLIENT_ID
+# Run: wrangler secret put GITHUB_CLIENT_SECRET

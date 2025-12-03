@@ -1,887 +1,217 @@
-import { Hono } from "hono";
-import type { Context } from "hono";
-import JSZip from "jszip";
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StreamableHTTPTransport } from '@hono/mcp';
-import { z } from 'zod';
+/**
+ * GitHub Repository Code Fetcher - Cloudflare Workers MCP Server with OAuth Provider
+ *
+ * Architecture:
+ * - Workers acts as OAuth Provider for ChatGPT connector (MCP client)
+ * - Workers performs GitHub OAuth to get user's GitHub access token
+ * - GitHub access token is stored in props and passed to MCP tools
+ * - Supports Protected Resource Metadata (RFC 9728) for MCP discovery
+ *
+ * Flow:
+ * 1. ChatGPT → /mcp → 401 + WWW-Authenticate (resource_metadata)
+ * 2. ChatGPT discovers Authorization Server via PRM
+ * 3. ChatGPT → /authorize → Workers → GitHub OAuth → /github/callback
+ * 4. Workers issues access token with props.githubAccessToken
+ * 5. ChatGPT → /mcp with Bearer token → MCP tools use githubAccessToken
+ *
+ * Related modules:
+ * - mcp.ts: MCP server and /mcp endpoint
+ * - app.ts: Browser UI for direct access
+ * - github.ts: GitHub API interaction and file processing
+ * - env.ts: Environment variable type definitions
+ */
+import OAuthProvider from "@cloudflare/workers-oauth-provider";
+import { WorkerEntrypoint } from "cloudflare:workers";
+import { createMcpApp, type AuthProps } from "./mcp";
+import { createWebApp } from "./app";
+import type { EnvBindings } from "./env";
 
-const app = new Hono();
+type Env = EnvBindings & {
+  OAUTH_KV: KVNamespace;
+};
 
-// MCP サーバーの設定
-const mcpServer = new McpServer({
-  name: 'github-pera1-mcp-server',
-  version: '1.2.0',
-});
+/**
+ * MCP API Handler - Called for authenticated /mcp requests
+ * Receives props (including githubAccessToken) from OAuthProvider
+ */
+export class McpApiHandler extends WorkerEntrypoint<Env> {
+  private mcpApp = createMcpApp();
 
-// GitHubコード取得ツールの登録
-mcpServer.registerTool("fetch_github_code", {
-  title: "GitHub Code Fetcher",
-  description: "Fetch code from GitHub repositories with flexible filtering options",
-  inputSchema: {
-    url: z.string().describe("GitHub repository URL (e.g., https://github.com/owner/repo)"),
-    dir: z.string().optional().describe("Filter by directory path (optional)"),
-    ext: z.string().optional().describe("Filter by file extensions (optional)"),
-    branch: z.string().optional().describe("Git branch name (optional)"),
-    file: z.string().optional().describe("Specific file to fetch (optional)"),
-    mode: z.enum(["tree", "full"]).optional().describe("Display mode (optional)")
+  async fetch(request: Request): Promise<Response> {
+    // Props from OAuthProvider are available via this.ctx.props
+    return this.mcpApp.fetch(request, this.env, this.ctx);
   }
-},
-  async (args) => {
-    try {
-      // パラメータバリデーション
-      if (!args || typeof args !== 'object') {
-        throw new Error('Arguments are required');
+}
+
+/**
+ * Default Handler - Handles OAuth flow and browser UI
+ */
+const defaultHandler = {
+  async fetch(
+    request: Request,
+    env: Env,
+    ctx: ExecutionContext
+  ): Promise<Response> {
+    const url = new URL(request.url);
+
+    // 1. ChatGPT → /authorize (OAuth authorization endpoint)
+    if (url.pathname === "/authorize") {
+      console.log("[/authorize] Query params:", Object.fromEntries(url.searchParams));
+
+      // Parse the OAuth authorization request from ChatGPT
+      const oauthReq = await (env as any).OAUTH_PROVIDER.parseAuthRequest(request);
+      console.log("[/authorize] Parsed oauthReq:", JSON.stringify(oauthReq, null, 2));
+
+      if (!oauthReq) {
+        return new Response("Invalid OAuth request", { status: 400 });
       }
-      
-      if (!args.url) {
-        throw new Error('URL parameter is required. Please provide a GitHub repository URL (e.g., https://github.com/owner/repo)');
-      }
-      
-      if (typeof args.url !== 'string' || args.url.trim() === '') {
-        throw new Error('URL must be a non-empty string');
-      }
-      
-      // 既存のGitHub処理ロジックを再利用
-      const result = await processGitHubRepository(args);
-      
-      return {
-        content: [{
-          type: 'text',
-          text: result
-        }]
-      };
-    } catch (error) {
-      throw new Error(`Failed to fetch GitHub code: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
-  }
-);
 
-// 既存のGitHub処理ロジックを関数として抽出
-async function processGitHubRepository(params: any): Promise<string> {
-  const { url, dir, ext, branch: paramBranch, file: queryFile, mode } = params;
-  
-  let parsed: URL;
-  try {
-    parsed = new URL(url.startsWith('http') ? url : `https://${url}`);
-  } catch (error) {
-    throw new Error(`Invalid URL: ${error instanceof Error ? error.message : 'Unknown error'}`);
-  }
-
-  const segments = parsed.pathname.split("/").filter(Boolean);
-  if (segments.length < 2) {
-    throw new Error("Invalid GitHub repository URL format");
-  }
-
-  const owner = segments[0];
-  const repo = segments[1];
-  
-  // パラメータの処理
-  const queryDirs = dir?.split(",").map(d => d.trim()).filter(d => d);
-  const queryExts = ext?.split(",").map(e => e.trim().toLowerCase()).filter(e => e);
-  const isTreeMode = mode === "tree";
-  
-  // URLパスからの情報抽出は簡略化（パラメータ優先）
-  let branch = paramBranch || "main";
-  let finalTargetDirs: string[] = [];
-  if (queryDirs && queryDirs.length > 0) {
-    finalTargetDirs = queryDirs.map(d => d.endsWith('/') ? d : d + '/');
-  }
-  const targetExts = queryExts || [];
-  const targetFile = queryFile;
-
-  // ZIP取得
-  let zipResp = await fetchZip(owner, repo, branch);
-  if (!zipResp.ok) {
-    // デフォルトブランチへのフォールバック
-    const defaultBranches = ["main", "master"];
-    let foundBranch = false;
-    for (const defaultBranch of defaultBranches) {
-      if (branch === defaultBranch) continue;
-      
-      const tempResp = await fetchZip(owner, repo, defaultBranch);
-      if (tempResp.ok) {
-        branch = defaultBranch;
-        zipResp = tempResp;
-        foundBranch = true;
-        break;
-      }
-    }
-    
-    if (!foundBranch) {
-      throw new Error(`Failed to fetch repository: ${zipResp.status} ${zipResp.statusText}`);
-    }
-  }
-
-  const arrayBuffer = await zipResp.arrayBuffer();
-  const jszip = await JSZip.loadAsync(arrayBuffer);
-  const rootPrefix = `${repo}-${branch}/`;
-
-  // TypeScript プロジェクト判定
-  const hasTsConfig = Object.keys(jszip.files).some(
-    (name) => name.startsWith(rootPrefix) && name.endsWith("tsconfig.json")
-  );
-
-  const fileTree = new Map<string, { size: number; content: string; isTruncated?: boolean }>();
-  let originalTotalSize = 0;
-  let displayTotalSize = 0;
-
-  for (const fileObj of Object.values(jszip.files)) {
-    if (fileObj.dir) continue;
-    if (!fileObj.name.startsWith(rootPrefix)) continue;
-
-    const fileRelative = fileObj.name.slice(rootPrefix.length);
-
-    // ファイルフィルタリング
-    if (targetFile) {
-      if (fileRelative !== targetFile) continue;
-    } else {
-      if (!shouldIncludeFile(fileRelative, finalTargetDirs, targetExts)) continue;
-    }
-
-    const isReadmeFile = /readme\.md$/i.test(fileRelative);
-
-    if (isTreeMode && !isReadmeFile) {
-      fileTree.set(fileRelative, { size: 0, content: "" });
-    } else {
-      const content = await fileObj.async("string");
-      const size = new TextEncoder().encode(content).length;
-
-      if (shouldSkipFile(fileRelative, size, content, hasTsConfig)) {
-        continue;
-      }
-      
-      let isTruncated = false;
-      let processedContent = content;
-      let displaySize = size;
-      
-      if (size > MAX_DISPLAY_FILE_SIZE) {
-        processedContent = content.substring(0, MAX_DISPLAY_FILE_SIZE);
-        const remainingSize = (size - MAX_DISPLAY_FILE_SIZE) / 1024;
-        processedContent += `\n\nThis file is too large, truncated at 30KB. There is ${remainingSize.toFixed(2)}KB remaining.`;
-        isTruncated = true;
-        displaySize = MAX_DISPLAY_FILE_SIZE;
-      }
-      
-      originalTotalSize += size;
-      displayTotalSize += displaySize;
-      
-      fileTree.set(fileRelative, { 
-        size, 
-        content: processedContent,
-        isTruncated
+      // Store OAuth request in KV for later retrieval in callback
+      const state = crypto.randomUUID();
+      await env.OAUTH_KV.put(`oauthreq:${state}`, JSON.stringify(oauthReq), {
+        expirationTtl: 600,
       });
-    }
-  }
 
-  // 単一ファイル指定の場合
-  if (targetFile) {
-    const fileEntry = fileTree.get(targetFile);
-    if (!fileEntry) {
-      throw new Error(`File not found: ${targetFile}`);
-    }
-    return fileEntry.content;
-  }
+      // Redirect to GitHub OAuth authorization
+      const githubAuthUrl = new URL("https://github.com/login/oauth/authorize");
+      githubAuthUrl.searchParams.set("client_id", env.GITHUB_CLIENT_ID);
+      githubAuthUrl.searchParams.set(
+        "redirect_uri",
+        `${url.origin}/github/callback`
+      );
+      githubAuthUrl.searchParams.set("state", state);
+      githubAuthUrl.searchParams.set("scope", "repo");
+      githubAuthUrl.searchParams.set("allow_signup", "false");
 
-  // レスポンス生成
-  if (isTreeMode) {
-    let resultText = "# Directory Structure\n\n";
-    resultText += createTreeDisplay(fileTree, false);
-    
-    const readmeFiles = Array.from(fileTree.entries())
-      .filter(([path, { content }]) => /readme\.md$/i.test(path) && content);
-    
-    if (readmeFiles.length > 0) {
-      resultText += "\n# README Files\n\n";
-      for (const [path, { content }] of readmeFiles) {
-        resultText += `## ${path}\n\n${content}\n\n`;
+      return Response.redirect(githubAuthUrl.toString(), 302);
+    }
+
+    // 2. GitHub → /github/callback (OAuth callback from GitHub)
+    if (url.pathname === "/github/callback") {
+      console.log("[/github/callback] Query params:", Object.fromEntries(url.searchParams));
+
+      const code = url.searchParams.get("code");
+      const state = url.searchParams.get("state");
+      if (!code || !state) {
+        return new Response("Missing code or state", { status: 400 });
       }
-    }
-    
-    return resultText;
-  } else {
-    let resultText = "# 📁 File Tree\n\n";
-    resultText += createTreeDisplay(fileTree, true);
 
-    resultText += `\n# 📝 Files (Total: ${(originalTotalSize / 1024).toFixed(2)} KB→${(displayTotalSize / 1024).toFixed(2)} KB)\n\n`;
-    for (const [path, { content }] of fileTree) {
-      resultText += `\`\`\`${path}\n${content}\n\`\`\`\n\n`;
-    }
+      // Retrieve stored OAuth request
+      const stored = await env.OAUTH_KV.get(`oauthreq:${state}`);
+      console.log("[/github/callback] Stored oauthReq from KV:", stored);
 
-    return resultText;
-  }
-}
+      if (!stored) {
+        return new Response("Invalid or expired state", { status: 400 });
+      }
+      await env.OAUTH_KV.delete(`oauthreq:${state}`);
 
-// GitHub リポジトリの例
-const EXAMPLE_REPO = "https://github.com/kazuph/github-pera1-workers";
+      const oauthReq = JSON.parse(stored);
+      console.log("[/github/callback] Parsed oauthReq:", JSON.stringify(oauthReq, null, 2));
 
-// エラー応答生成関数
-function createErrorResponse(
-	c: Context,
-	targetUrl: string,
-	errorMessage: string,
-	status: 400 | 403 | 404 | 500,
-) {
-	const host = c.req.header("host") || "";
-	const protocol = c.req.url.startsWith("https") ? "https" : "http";
-	const fullUrl = targetUrl
-		? `${protocol}://${host}/${targetUrl}`
-		: `${protocol}://${host}/${EXAMPLE_REPO}`;
+      // Exchange code for GitHub access token
+      const tokenRes = await fetch(
+        "https://github.com/login/oauth/access_token",
+        {
+          method: "POST",
+          headers: {
+            Accept: "application/json",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            client_id: env.GITHUB_CLIENT_ID,
+            client_secret: env.GITHUB_CLIENT_SECRET,
+            code,
+            redirect_uri: `${url.origin}/github/callback`,
+          }),
+        }
+      );
 
-	return c.html(
-		`
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-      <title>github pera1</title>
-      <style>
-        body {
-          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-          line-height: 1.6;
-          color: #333;
-          max-width: 800px;
-          margin: 0 auto;
-          padding: 2rem;
-        }
-        h1 {
-          color: #0366d6;
-          margin-bottom: 1.5rem;
-        }
-        .error {
-          color: #cb2431;
-          background-color: #ffeef0;
-          border: 1px solid #ffdce0;
-          border-radius: 6px;
-          padding: 1rem;
-          margin-bottom: 1.5rem;
-        }
-        .example {
-          margin-bottom: 1.5rem;
-        }
-        form {
-          background-color: #f6f8fa;
-          border: 1px solid #e1e4e8;
-          border-radius: 6px;
-          padding: 1.5rem;
-          margin-bottom: 1.5rem;
-        }
-        .form-group {
-          margin-bottom: 1rem;
-        }
-        label {
-          display: block;
-          margin-bottom: 0.5rem;
-          font-weight: 600;
-        }
-        input, select {
-          width: 100%;
-          padding: 0.5rem;
-          border: 1px solid #e1e4e8;
-          border-radius: 4px;
-          font-family: inherit;
-          font-size: 1rem;
-        }
-        .form-hint {
-          font-size: 0.85rem;
-          color: #586069;
-          margin-top: 0.25rem;
-        }
-        button {
-          background-color: #2ea44f;
-          color: #fff;
-          border: 1px solid rgba(27, 31, 35, 0.15);
-          border-radius: 6px;
-          padding: 0.5rem 1rem;
-          font-size: 1rem;
-          font-weight: 600;
-          cursor: pointer;
-        }
-        button:hover {
-          background-color: #2c974b;
-        }
-        code {
-          background-color: #f6f8fa;
-          padding: 0.2rem 0.4rem;
-          border-radius: 3px;
-          font-family: SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace;
-          font-size: 0.85rem;
-        }
-      </style>
-    </head>
-    <body>
-      <h1>github pera1</h1>
-      
-      ${errorMessage ? `<div class="error">Error: ${errorMessage}</div>` : ''}
-      
-      <div class="example">
-        ${
-					!targetUrl
-						? `<p>Example: <a href="${fullUrl}">${fullUrl}</a></p>`
-						: `<p>URL: <a href="${fullUrl}">${fullUrl}</a></p>`
-				}
-      </div>
-      
-      <form action="" method="get" id="pera1-form">
-        <h2>Set Parameters</h2>
-        
-        <div class="form-group">
-          <label for="repo-url">GitHub Repository URL</label>
-          <input type="text" id="repo-url" placeholder="https://github.com/username/repository" value="${targetUrl || ''}">
-          <div class="form-hint">Enter full GitHub URL including https://</div>
-        </div>
-        
-        <div class="form-group">
-          <label for="dir">Directories (Optional)</label>
-          <input type="text" id="dir" placeholder="src,components,lib" name="dir">
-          <div class="form-hint">Filter files by directory paths (comma-separated)</div>
-        </div>
-        
-        <div class="form-group">
-          <label for="ext">Extensions (Optional)</label>
-          <input type="text" id="ext" placeholder="ts,js,tsx" name="ext">
-          <div class="form-hint">Filter files by extensions (comma-separated, without dots)</div>
-        </div>
-        
-        <div class="form-group">
-          <label for="mode">Display Mode</label>
-          <select id="mode" name="mode">
-            <option value="">Full Mode (default)</option>
-            <option value="tree">Tree Mode (structure + README only)</option>
-          </select>
-        </div>
-        
-        <div class="form-group">
-          <label for="branch">Branch (Optional)</label>
-          <input type="text" id="branch" placeholder="main" name="branch">
-          <div class="form-hint">Defaults to main or master if not specified</div>
-        </div>
-        
-        <div class="form-group">
-          <label for="file">Single File (Optional)</label>
-          <input type="text" id="file" placeholder="src/App.js" name="file">
-          <div class="form-hint">Retrieve only a specific file</div>
-        </div>
-        
-        <button type="submit">Generate View</button>
-      </form>
-      
-      <div>
-        <h2>How to Use</h2>
-        <p>This tool fetches code from GitHub repositories and combines files into a single view.</p>
-        <p>Examples:</p>
-        <ul>
-          <li>Basic: <code>${protocol}://${host}/github.com/username/repo</code></li>
-          <li>With branch: <code>${protocol}://${host}/github.com/username/repo/tree/branch-name</code></li>
-          <li>With params: <code>${protocol}://${host}/github.com/username/repo?dir=src&ext=ts,tsx</code></li>
-        </ul>
-      </div>
-      
-      <script>
-        document.getElementById('pera1-form').addEventListener('submit', function(e) {
-          e.preventDefault();
-          
-          const repoUrl = document.getElementById('repo-url').value.trim();
-          if (!repoUrl) {
-            alert('Please enter a GitHub repository URL');
-            return;
-          }
-          
-          // Build the base URL (removing https:// if present)
-          let baseUrl = repoUrl;
-          if (baseUrl.startsWith('https://')) {
-            baseUrl = baseUrl.substring(8);
-          }
-          
-          // Build query parameters
-          const params = new URLSearchParams();
-          
-          const dir = document.getElementById('dir').value.trim();
-          if (dir) params.set('dir', dir);
-          
-          const ext = document.getElementById('ext').value.trim();
-          if (ext) params.set('ext', ext);
-          
-          const mode = document.getElementById('mode').value;
-          if (mode) params.set('mode', mode);
-          
-          const branch = document.getElementById('branch').value.trim();
-          if (branch) params.set('branch', branch);
-          
-          const file = document.getElementById('file').value.trim();
-          if (file) params.set('file', file);
-          
-          // Build the final URL
-          let finalUrl = '${protocol}://${host}/' + baseUrl;
-          const queryString = params.toString();
-          if (queryString) {
-            finalUrl += '?' + queryString;
-          }
-          
-          window.location.href = finalUrl;
+      if (!tokenRes.ok) {
+        console.error(
+          "Failed to fetch GitHub token:",
+          tokenRes.status,
+          tokenRes.statusText
+        );
+        return new Response("Failed to fetch GitHub token", { status: 500 });
+      }
+
+      const tokenJson = (await tokenRes.json()) as {
+        access_token?: string;
+        error?: string;
+        error_description?: string;
+      };
+
+      if (tokenJson.error) {
+        console.error("GitHub OAuth error:", tokenJson.error, tokenJson.error_description);
+        return new Response(
+          `GitHub OAuth error: ${tokenJson.error_description || tokenJson.error}`,
+          { status: 500 }
+        );
+      }
+
+      const githubAccessToken = tokenJson.access_token;
+      if (!githubAccessToken) {
+        return new Response("GitHub access_token missing in response", {
+          status: 500,
         });
-      </script>
-    </body>
-    </html>
-  `,
-		status,
-	);
-}
+      }
 
-// GitHubリポジトリのZIPファイルを取得
-async function fetchZip(owner: string, repo: string, branch: string) {
-	const zipUrl = `https://codeload.github.com/${owner}/${repo}/zip/${branch}`;
-	console.log(`📦 Fetching zip from: ${zipUrl}`);
-	return await fetch(zipUrl, {
-		headers: {
-			"User-Agent": "Pera1-Bot",
-		},
-	});
-}
+      // Get GitHub user info to use as userId
+      // IMPORTANT: userId must NOT contain colons (:) as it's used in authorization code format
+      // Code format is userId:grantId:authCodeId - extra colons break parsing
+      const userRes = await fetch("https://api.github.com/user", {
+        headers: {
+          Authorization: `Bearer ${githubAccessToken}`,
+          "User-Agent": "Pera1-MCP-Server",
+          Accept: "application/vnd.github.v3+json",
+        },
+      });
 
-// 定数
-const MAX_DISPLAY_FILE_SIZE = 30 * 1024; // 30KB
+      let userId = `github_${state}`;
+      if (userRes.ok) {
+        const userJson = (await userRes.json()) as { id?: number; login?: string };
+        if (userJson.id) {
+          userId = `github_${userJson.id}`;
+        }
+      }
+      console.log("[/github/callback] userId:", userId);
 
-// ディレクトリツリー文字列の生成
-function createTreeDisplay(
-	fileTree: Map<string, { size: number; content: string; isTruncated?: boolean }>,
-	showSize = false,
-): string {
-	const dirs = new Set<string>();
+      // Complete authorization and issue our access token
+      // The props will be available in McpApiHandler via this.ctx.props
+      console.log("[/github/callback] Calling completeAuthorization with:", {
+        request: oauthReq,
+        userId,
+        metadata: { provider: "github" },
+        scope: oauthReq.scope,
+      });
 
-	for (const [path] of fileTree) {
-		const parts = path.split("/");
-		for (let i = 1; i <= parts.length; i++) {
-			dirs.add(parts.slice(0, i).join("/"));
-		}
-	}
+      const { redirectTo } = await (env as any).OAUTH_PROVIDER.completeAuthorization({
+        request: oauthReq,
+        userId,
+        metadata: { provider: "github" },
+        scope: oauthReq.scope,
+        props: {
+          githubAccessToken,
+        } as AuthProps,
+      });
 
-	const sortedDirs = Array.from(dirs).sort();
-	let result = "";
+      console.log("[/github/callback] completeAuthorization redirectTo:", redirectTo);
+      return Response.redirect(redirectTo, 302);
+    }
 
-	for (const dir of sortedDirs) {
-		const depth = dir.split("/").length - 1;
-		const indent = "  ".repeat(depth);
-		const name = dir.split("/").pop() || "";
-		const isFile = !Array.from(dirs).some((d) => d.startsWith(dir + "/"));
+    // 3. Everything else → Browser UI (Web app)
+    const webApp = createWebApp();
+    return webApp.fetch(request, env, ctx);
+  },
+};
 
-		if (showSize && isFile) {
-			const fileInfo = fileTree.get(dir);
-			if (fileInfo) {
-				const sizeKB = (fileInfo.size / 1024).toFixed(2);
-				if (fileInfo.isTruncated) {
-					result += `${indent}📄 ${name} (${sizeKB} KB→30KB truncated)\n`;
-				} else {
-					result += `${indent}📄 ${name} (${sizeKB} KB)\n`;
-				}
-			} else {
-				result += `${indent}📄 ${name} (0.00 KB)\n`;
-			}
-		} else {
-			result += `${indent}${isFile ? "📄" : "📂"} ${name}\n`;
-		}
-	}
-
-	return result;
-}
-
-// バイナリコンテンツ判定
-function isBinaryContent(content: string): boolean {
-	const sampleSize = Math.min(content.length, 1000);
-	let nonPrintable = 0;
-	for (let i = 0; i < sampleSize; i++) {
-		const charCode = content.charCodeAt(i);
-		if (charCode === 0 || (charCode < 32 && ![9, 10, 13].includes(charCode))) {
-			nonPrintable++;
-		}
-	}
-	return nonPrintable / sampleSize > 0.05;
-}
-
-// 出力スキップ判定用（バイナリや大サイズファイル、ロックファイルなど）
-function shouldSkipFile(
-	filename: string,
-	size: number,
-	content: string | undefined,
-	hasTsConfig: boolean,
-): boolean {
-	const MAX_FILE_SIZE = 500 * 1024; // 500KB
-	const imageExtensions = new Set([
-		".png",
-		".jpg",
-		".jpeg",
-		".gif",
-		".bmp",
-		".ico",
-		".webp",
-		".svg",
-	]);
-	const binaryExtensions = new Set([
-		".zip",
-		".tar",
-		".gz",
-		".rar",
-		".7z",
-		".exe",
-		".dll",
-		".so",
-		".dylib",
-		".pdf",
-		".doc",
-		".docx",
-		".xls",
-		".xlsx",
-		".ppt",
-		".pptx",
-		".mp3",
-		".mp4",
-		".avi",
-		".mov",
-		".wav",
-		".bin",
-		".dat",
-		".db",
-		".sqlite",
-	]);
-
-	const ext = filename.toLowerCase().split(".").pop() || "";
-
-	// ロックファイル除外
-	if (filename.match(/-lock\.|\.lock$/)) return true;
-
-	// バイナリ拡張子除外
-	if (imageExtensions.has(`.${ext}`) || binaryExtensions.has(`.${ext}`))
-		return true;
-
-	// TSプロジェクトの場合、.jsや.mjsは除外
-	if (hasTsConfig && (filename.endsWith(".js") || filename.endsWith(".mjs")))
-		return true;
-
-	// サイズ制限
-	if (size > MAX_FILE_SIZE) return true;
-
-	// 中身がバイナリ
-	if (content && isBinaryContent(content)) return true;
-
-	return false;
-}
-
-// ディレクトリ・拡張子フィルタによる出力可否
-function shouldIncludeFile(
-	filename: string,
-	targetDirs: string[],
-	targetExts: string[],
-): boolean {
-	// ディレクトリフィルタ
-	if (targetDirs.length > 0) {
-		const matchesDir = targetDirs.some((dir) => {
-			const normalizedDir = dir.endsWith("/") ? dir : `${dir}/`;
-			return filename.startsWith(normalizedDir);
-		});
-		if (!matchesDir) return false;
-	}
-
-	// 拡張子フィルタ
-	if (targetExts.length > 0) {
-		const ext = filename.split(".").pop()?.toLowerCase() || "";
-		if (!targetExts.includes(ext)) return false;
-	}
-
-	return true;
-}
-
-// MCP エンドポイント
-app.all('/mcp', async (c) => {
-  const transport = new StreamableHTTPTransport()
-  await mcpServer.connect(transport)
-  return transport.handleRequest(c)
+// Worker entry point with OAuthProvider wrapper
+export default new OAuthProvider({
+  apiRoute: "/mcp",
+  apiHandler: McpApiHandler,
+  defaultHandler: defaultHandler as any,
+  authorizeEndpoint: "/authorize",
+  tokenEndpoint: "/token",
+  clientRegistrationEndpoint: "/register",
+  scopesSupported: ["repo"],
 });
-
-app.get("/*", async (c) => {
-	try {
-		const url = new URL(c.req.url);
-		const path = url.pathname.slice(1);
-		const params = url.searchParams;
-
-		// パラメータ抽出 (クエリパラメータ)
-		const queryDirs = params.get("dir")?.split(",").map(d => d.trim()).filter(d => d);
-		const queryExts = params.get("ext")?.split(",").map(e => e.trim().toLowerCase()).filter(e => e);
-		const isTreeMode = params.get("mode") === "tree";
-		const paramBranch = params.get("branch")?.trim();
-		const queryFile = params.get("file")?.trim(); // クエリパラメータのfile
-
-		if (!path) {
-			return createErrorResponse(c, "", "No repository URL provided", 400);
-		}
-
-		let urlStr = path.startsWith("http") ? path : `https://${path}`;
-
-		let parsed: URL;
-		try {
-			parsed = new URL(urlStr);
-		} catch (error) {
-			const msg = `Invalid URL: ${error instanceof Error ? error.message : "Unknown error"}`;
-			return createErrorResponse(c, urlStr, msg, 400);
-		}
-
-		const segments = parsed.pathname.split("/").filter(Boolean);
-		if (segments.length < 2) {
-			return createErrorResponse(
-				c,
-				urlStr,
-				"Invalid GitHub repository URL format",
-				400,
-			);
-		}
-
-		const owner = segments[0];
-		const repo = segments[1];
-
-		// URLパスからブランチ名、ディレクトリパス、ファイルパスを抽出
-		let urlBranch: string | undefined;
-		let urlDir: string | undefined;
-		let urlFilePath: string | undefined; // blob URL用のファイルパス
-
-		if (segments.length > 3 && segments[2] === "tree") {
-			// /tree/ の後の部分を解析 (例: /tree/branch/path/to/dir)
-			const branchAndDirParts = segments.slice(3);
-			urlBranch = branchAndDirParts[0]; // 最初の部分をブランチ名候補
-			if (branchAndDirParts.length > 1) {
-				urlDir = branchAndDirParts.slice(1).join("/");
-			}
-		} else if (segments.length > 3 && segments[2] === "blob") {
-			// /blob/ の後の部分を解析 (例: /blob/branch/path/to/file)
-			const branchAndFileParts = segments.slice(3);
-			urlBranch = branchAndFileParts[0];
-			if (branchAndFileParts.length > 1) {
-				urlFilePath = branchAndFileParts.slice(1).join("/"); // 残りをファイルパス候補
-			}
-		} else if (segments.length > 2 && segments[2] !== "tree" && segments[2] !== "blob") {
-			// /owner/repo/path/to/dir or /owner/repo/file.txt の場合 (ブランチはデフォルト)
-			// この時点ではディレクトリかファイルか不明瞭だが、後続の処理で targetFile が優先される
-			urlDir = segments.slice(2).join("/"); // 一旦ディレクトリとして扱う
-		}
-
-		// ブランチ名の決定 (クエリパラメータ > URLパス > デフォルト "main")
-		let branch = paramBranch || urlBranch || "main";
-
-		// ディレクトリの決定 (クエリパラメータとURLパスを結合)
-		let finalTargetDirs: string[] = [];
-		if (queryDirs && queryDirs.length > 0) {
-				// クエリパラメータの dir が指定されている場合
-				if (urlDir) {
-						// URLパスにもディレクトリがある場合、結合する
-						const basePath = urlDir.endsWith('/') ? urlDir : urlDir + '/';
-						finalTargetDirs = queryDirs.map(d => {
-								const relativePath = d.startsWith('/') ? d.slice(1) : d;
-								// 結合時に末尾のスラッシュを統一（shouldIncludeFile の挙動に合わせる）
-								const combined = basePath + relativePath;
-								return combined.endsWith('/') ? combined : combined + '/';
-						});
-				} else {
-						// URLパスにディレクトリがない場合、クエリパラメータの dir をそのまま使用
-						// 末尾スラッシュ統一
-						finalTargetDirs = queryDirs.map(d => d.endsWith('/') ? d : d + '/');
-				}
-		} else if (urlDir) {
-				// クエリパラメータがなく、URLパスにディレクトリがある場合
-				// 末尾スラッシュ統一
-				finalTargetDirs = [urlDir.endsWith('/') ? urlDir : urlDir + '/'];
-		}
-		// 拡張子はクエリパラメータからのみ取得
-		const targetExts = queryExts || [];
-		// 単一ファイル指定の決定 (クエリパラメータ > URLパス)
-		// 単一ファイル指定の決定 (クエリパラメータ > URLパス > URLパス内のディレクトリ + クエリパラメータのファイル)
-		let targetFile: string | undefined;
-		if (queryFile) {
-			// クエリパラメータの file が最優先
-			if (urlDir) {
-				// URLにディレクトリパスがあり、クエリにファイルパスがある場合、結合
-				// パスの結合: スラッシュの重複を避ける
-				const basePath = urlDir.endsWith('/') ? urlDir : urlDir + '/';
-				const relativePath = queryFile.startsWith('/') ? queryFile.slice(1) : queryFile;
-				targetFile = basePath + relativePath;
-			} else {
-				// URLにディレクトリパスがなく、クエリにファイルパスがある場合
-				targetFile = queryFile;
-			}
-		} else if (urlFilePath) {
-			// クエリパラメータがなく、URLが /blob/ 形式の場合
-			targetFile = urlFilePath;
-		}
-
-		// ZIP取得
-		// ZIP取得とブランチのフォールバック処理
-		let zipResp = await fetchZip(owner, repo, branch);
-		if (!zipResp.ok) {
-			// ブランチが存在しない場合、デフォルトブランチ (main, master) を試す
-			const defaultBranches = ["main", "master"];
-			let foundBranch = false;
-			for (const defaultBranch of defaultBranches) {
-				// 現在試行中のブランチと同じ場合はスキップ
-				if (branch === defaultBranch) continue;
-
-				console.log(`🤔 Branch "${branch}" failed (${zipResp.status}). Trying default branch "${defaultBranch}"...`);
-				const tempResp = await fetchZip(owner, repo, defaultBranch);
-				if (tempResp.ok) {
-					branch = defaultBranch; // 成功したブランチ名に更新
-					zipResp = tempResp;
-					foundBranch = true;
-					console.log(`✅ Successfully switched to branch "${branch}"`);
-					break;
-				} else {
-					console.log(`👎 Default branch "${defaultBranch}" also failed (${tempResp.status}).`);
-				}
-			}
-
-			// デフォルトブランチでも失敗した場合
-			if (!foundBranch) {
-				const triedBranches = [paramBranch, urlBranch, "main", "master"].filter(Boolean).join('", "');
-				const errorMsg = `Failed to fetch zip for tried branches ("${triedBranches}"): ${zipResp.status} ${zipResp.statusText}`;
-				return createErrorResponse(c, urlStr, errorMsg, zipResp.status as 404 | 403 | 500);
-			}
-		}
-
-		if (!zipResp.ok) {
-			const errorMsg = `Failed to fetch zip: ${zipResp.status} ${zipResp.statusText}`;
-			return createErrorResponse(
-				c,
-				urlStr,
-				errorMsg,
-				zipResp.status as 404 | 403 | 500,
-			);
-		}
-
-		const arrayBuffer = await zipResp.arrayBuffer();
-		const jszip = await JSZip.loadAsync(arrayBuffer);
-		const rootPrefix = `${repo}-${branch}/`;
-
-		// tsconfig.json があればTSプロジェクト判定
-		const hasTsConfig = Object.keys(jszip.files).some(
-			(name) => name.startsWith(rootPrefix) && name.endsWith("tsconfig.json"),
-		);
-
-		const fileTree = new Map<string, { size: number; content: string; isTruncated?: boolean }>();
-		let originalTotalSize = 0; // 元のサイズ合計
-		let displayTotalSize = 0; // 表示用サイズ合計
-
-		for (const fileObj of Object.values(jszip.files)) {
-			if (fileObj.dir) continue;
-			if (!fileObj.name.startsWith(rootPrefix)) continue;
-
-			const fileRelative = fileObj.name.slice(rootPrefix.length);
-
-			// 単一ファイル指定がある場合の処理、またはディレクトリ/拡張子フィルタリング
-			if (targetFile) {
-				// 単一ファイル指定がある場合、そのファイル以外はスキップ
-				if (fileRelative !== targetFile) {
-						continue;
-				}
-				// targetFile と一致した場合、以降の dir/ext フィルタは適用しない
-			} else {
-				// targetFile が指定されていない場合のみ、dir/ext フィルタを適用
-				if (!shouldIncludeFile(fileRelative, finalTargetDirs, targetExts)) {
-						continue;
-				}
-			}
-
-			const isReadmeFile = /readme\.md$/i.test(fileRelative);
-
-			if (isTreeMode && !isReadmeFile) {
-				// ツリーモードではREADME以外はコンテンツを読み込まず、ツリーの構築のみ行う
-				fileTree.set(fileRelative, { size: 0, content: "" });
-			} else {
-				// 通常モードまたはREADMEファイルはファイルコンテンツを読み込む
-				const content = await fileObj.async("string");
-				const size = new TextEncoder().encode(content).length;
-
-				// スキップ条件チェック
-				if (shouldSkipFile(fileRelative, size, content, hasTsConfig)) {
-					continue;
-				}
-				
-				// ファイルサイズが30KB以上なら切り捨て
-				let isTruncated = false;
-				let processedContent = content;
-				let displaySize = size;
-				
-				if (size > MAX_DISPLAY_FILE_SIZE) {
-					// 30KBまでの内容に切り捨て
-					processedContent = content.substring(0, MAX_DISPLAY_FILE_SIZE);
-					// 残りのサイズを計算
-					const remainingSize = (size - MAX_DISPLAY_FILE_SIZE) / 1024;
-					// 切り捨てメッセージを追加
-					processedContent += `\n\nThis file is too large, truncated at 30KB. There is ${remainingSize.toFixed(2)}KB remaining.`;
-					isTruncated = true;
-					// 表示用のサイズを30KBに制限
-					displaySize = MAX_DISPLAY_FILE_SIZE;
-				}
-				
-				// 元のサイズを合計に追加
-				originalTotalSize += size;
-				// 表示用サイズを合計に追加
-				displayTotalSize += displaySize;
-				
-				fileTree.set(fileRelative, { 
-					size, 
-					content: processedContent,
-					isTruncated
-				});
-			}
-		}
-
-		// 単一ファイル指定がある場合の処理
-		if (targetFile) {
-			const fileEntry = fileTree.get(targetFile); // Map.get で直接取得
-			if (!fileEntry) {
-				// ファイルが見つからない場合のエラーメッセージを改善
-				const availableFiles = Array.from(fileTree.keys()).sort().join("\n - ");
-				const errorMsg = `File not found: ${targetFile}\n\nAvailable files matching filters (dir: ${finalTargetDirs.join(',') || 'none'}, ext: ${targetExts.join(',') || 'none'}):\n - ${availableFiles || '(No files found or matched filters)'}`;
-				return createErrorResponse(c, urlStr, errorMsg, 404);
-			}
-			// スキップされたファイル（バイナリ等）でないことを確認
-			if (fileEntry.content === undefined) {
-				return createErrorResponse(c, urlStr, `File content skipped (binary, large, etc.): ${targetFile}`, 400);
-			}
-			return c.text(fileEntry.content, 200);
-		}
-
-		// レスポンス生成
-		if (isTreeMode) {
-			// ツリーのみ表示（READMEファイルの内容も含める）
-			let resultText = "# Directory Structure\n\n";
-			resultText += createTreeDisplay(fileTree, false);
-			
-			// READMEファイルがあれば追加
-			const readmeFiles = Array.from(fileTree.entries())
-				.filter(([path, { content }]) => /readme\.md$/i.test(path) && content);
-			
-			if (readmeFiles.length > 0) {
-				resultText += "\n# README Files\n\n";
-				for (const [path, { content }] of readmeFiles) {
-					resultText += `## ${path}\n\n${content}\n\n`;
-				}
-			}
-			
-			return c.text(resultText, 200);
-		} else {
-			// 通常モード：ツリー＋ファイル内容
-			let resultText = "# 📁 File Tree\n\n";
-			resultText += createTreeDisplay(fileTree, true);
-
-			resultText += `\n# 📝 Files (Total: ${(originalTotalSize / 1024).toFixed(2)} KB→${(displayTotalSize / 1024).toFixed(2)} KB)\n\n`;
-			for (const [path, { content }] of fileTree) {
-				resultText += `\`\`\`${path}\n${content}\n\`\`\`\n\n`;
-			}
-
-			return c.text(resultText, 200);
-		}
-	} catch (e: unknown) {
-		const msg = `Unexpected error: ${e instanceof Error ? e.message : "Unknown error"}`;
-		console.error(`❌ ${msg}`);
-		return createErrorResponse(c, "", msg, 500);
-	}
-});
-
-export default app;

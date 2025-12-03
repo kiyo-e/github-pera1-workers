@@ -6,8 +6,10 @@ This project is a web application built using Cloudflare Workers and the Hono fr
 ## ✨ Features
 - 🔗 Accepts various GitHub repository URL formats (including `/tree/` and `/blob/` paths).
 - 🌳 Automatically extracts branch, directory, and file information from the URL path.
+- 🧭 Handles extra path segments without `/tree`/`/blob` by scoping to that directory (e.g., `/repo/src/utils`).
 - 📂 Filters files by directory paths and extensions using query parameters (`dir`, `ext`).
 - 🎯 Displays a specific single file using the `file` query parameter or `/blob/` URL path.
+- 🧩 `file`/`dir` query parameters are resolved relative to any directory selected in the path, so `/tree/main/src?file=app.tsx` finds `src/app.tsx`.
 - 🌲 Offers a "Tree Mode" (`mode=tree`) to show only the directory structure and README files.
 - 💾 Handles large files by truncating content over 30KB and indicating the truncation.
 - 🚫 Skips binary files, lock files, and certain generated files (like `.js` in TS projects) for a cleaner view.
@@ -54,6 +56,12 @@ The application interprets GitHub URLs provided in the path after your worker do
     ```
     *(Attempts `main`/`master`, implicitly sets `dir=path/to/dir`)*
 
+6.  **Scoped Path Without `/tree` (shorthand):**
+    ```
+    https://your-worker-domain/github.com/owner/repo/src/utils
+    ```
+    *(Treats `src/utils` as the directory filter on the default branch)*
+
 ### Query Parameters
 Append these to the URL to customize the output. Query parameters override values derived from the URL path (e.g., `?branch=...` overrides the branch from `/tree/...`).
 
@@ -77,6 +85,13 @@ Append these to the URL to customize the output. Query parameters override value
     ```
     ?file=src/index.js
     ```
+    *If a directory is chosen in the path (e.g., `/tree/main/src`), `file` is resolved relative to that base, so `?file=app.tsx` targets `src/app.tsx`.*
+
+### Error Responses
+- 400: Invalid input (missing/invalid URL, bad parameters)
+- 403: Access denied (e.g., private repo without token, rate-limited with 403)
+- 404: Repository/branch/file not found
+- 500: Unexpected server error
 
 ### Examples
 
