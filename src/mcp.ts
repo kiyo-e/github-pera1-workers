@@ -20,7 +20,7 @@ export type AuthProps = {
   githubAccessToken: string;
 };
 
-export function createMcpApp() {
+export function createMcpApp(getAuthProps?: () => AuthProps | undefined) {
   const app = new Hono<{ Bindings: EnvBindings }>();
 
   const mcpServer = new McpServer({
@@ -44,7 +44,7 @@ export function createMcpApp() {
     },
     async (args, ctx) => {
       // OAuthProvider passes props containing githubAccessToken
-      const props = (ctx as any).props as AuthProps | undefined;
+      const props = getAuthProps ? getAuthProps() : undefined;
       const githubToken = props?.githubAccessToken ?? null;
 
       try {

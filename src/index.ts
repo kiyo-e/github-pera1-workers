@@ -33,9 +33,12 @@ type Env = EnvBindings & {
 /**
  * MCP API Handler - Called for authenticated /mcp requests
  * Receives props (including githubAccessToken) from OAuthProvider
+ *
+ * Design doc: see README.md (Architecture section)
+ * Related classes: mcp.ts (MCP server), app.ts (browser UI fallback)
  */
 export class McpApiHandler extends WorkerEntrypoint<Env> {
-  private mcpApp = createMcpApp();
+  private mcpApp = createMcpApp(() => (this.ctx as any).props as AuthProps | undefined);
 
   async fetch(request: Request): Promise<Response> {
     // Props from OAuthProvider are available via this.ctx.props
